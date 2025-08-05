@@ -52,10 +52,17 @@ class TextChunk:
     end_position: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     word_count: int = 0
-    
+    summary: Optional[str] = None
+
+
     def __post_init__(self):
         if not self.word_count:
             self.word_count = len(self.content.split())
+
+        if not self.summary and self.content:
+            sentences = sent_tokenize(self.content.strip())
+            self.summary = sentences[0] if sentences else self.content.strip()[:150]
+
 
 @dataclass
 class ExtractedDocument:
@@ -549,42 +556,40 @@ class SmartTextChunker:
         self.stop_words = set(stopwords.words('english'))
     
     async def rechunk_document(self, extracted_doc: ExtractedDocument) -> ExtractedDocument:
-        """Apply advanced chunking strategies to improve semantic coherence"""
-        logger.info(f"Applying advanced chunking to document: {extracted_doc.document_id}")
-        
-        # Combine similar chunks and optimize for semantic search
+        logger.info(f"Applying enhanced chunking to document: {extracted_doc.document_id}")
+
         optimized_chunks = []
-        
-        # Group chunks by type
+
+        # Prefer sections as-is
         section_chunks = [c for c in extracted_doc.chunks if c.chunk_type == "section"]
         paragraph_chunks = [c for c in extracted_doc.chunks if c.chunk_type == "paragraph"]
         table_chunks = [c for c in extracted_doc.chunks if c.chunk_type == "table"]
-        
-        # Process sections with intelligent splitting
+
+        # Add all section chunks directly, summarizing each
         for chunk in section_chunks:
-            if len(chunk.content) > self.chunk_size:
-                sub_chunks = await self._split_large_chunk(chunk)
-                optimized_chunks.extend(sub_chunks)
-            else:
-                optimized_chunks.append(chunk)
-        
-        # Combine small consecutive paragraphs
-        combined_para_chunks = await self._combine_small_chunks(paragraph_chunks)
-        optimized_chunks.extend(combined_para_chunks)
-        
-        # Keep table chunks as-is (they're usually well-structured)
-        optimized_chunks.extend(table_chunks)
-        
-        # Create sliding window chunks for better coverage
-        sliding_chunks = await self._create_sliding_window_chunks(extracted_doc.full_text, extracted_doc.document_id)
-        optimized_chunks.extend(sliding_chunks)
-        
-        # Update the document with optimized chunks
+            chunk.summary = self._generate_summary(chunk.content)
+            optimized_chunks.append(chunk)
+
+        # Keep full paragraphs
+        for chunk in paragraph_chunks:
+            chunk.summary = self._generate_summary(chunk.content)
+            optimized_chunks.append(chunk)
+
+        # Table rows as chunks
+        for chunk in table_chunks:
+            chunk.summary = self._generate_summary(chunk.content)
+            optimized_chunks.append(chunk)
+
+    # Optionally: add sliding window chunks for recall boost
+    # sliding_chunks = await self._create_sliding_window_chunks(extracted_doc.full_text, extracted_doc.document_id)
+    # optimized_chunks.extend(sliding_chunks)
+
         extracted_doc.chunks = optimized_chunks
-        extracted_doc.processing_stats["chunking_strategy"] = "advanced"
+        extracted_doc.processing_stats["chunking_strategy"] = "section_paragraph_table_summary"
         extracted_doc.processing_stats["total_chunks"] = len(optimized_chunks)
-        
+
         return extracted_doc
+
     
     async def _split_large_chunk(self, chunk: TextChunk) -> List[TextChunk]:
         """Split large chunks while preserving semantic boundaries"""
@@ -687,6 +692,11 @@ class SmartTextChunker:
             sliding_chunks.append(chunk)
         
         return sliding_chunks
+    
+    def _generate_summary(self, text: str) -> str:
+        sentences = sent_tokenize(text.strip())
+        return sentences[0].strip() if sentences else text.strip()[:150]
+
 
 class DocumentTextProcessor:
     """Main text processing service that orchestrates all extractors"""
@@ -764,6 +774,7 @@ class DocumentTextProcessor:
                     "chunk_type": chunk.chunk_type,
                     "page_number": chunk.page_number,
                     "section_title": chunk.section_title,
+                    "summary": chunk.summary,  # <-- Add this line
                     "word_count": chunk.word_count,
                     "metadata": chunk.metadata
                 }
@@ -774,10 +785,10 @@ class DocumentTextProcessor:
             "extraction_timestamp": extracted_doc.extraction_timestamp.isoformat(),
             "processing_stats": extracted_doc.processing_stats
         }
-        
+
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(doc_dict, f, indent=2, ensure_ascii=False)
-        
+
         logger.info(f"Extracted document saved to: {output_path}")
 
 # Usage example
@@ -808,6 +819,8 @@ async def main():
             print(f"ID: {chunk.chunk_id}")
             if chunk.section_title:
                 print(f"Section: {chunk.section_title}")
+            print(f"Summary: {chunk.summary}")
+
             print(f"Content preview: {chunk.content[:200]}...")
         
         # Save extracted document

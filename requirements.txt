@@ -19,3 +19,6 @@ torch
 transformers
 sentence-transformers
 nltk>=3.8
+
+# Query processing dependencies
+google-generativeai>=0.3.0

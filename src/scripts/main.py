@@ -14,13 +14,13 @@ async def process_hackrx_policy_document():
     
     # Configure for insurance documents
     embedding_config = EmbeddingConfig()
-    embedding_config.model_name = "sentence-transformers/all-MiniLM-L6-v2"  # Fast and good
-    embedding_config.dimensions = 384
+    embedding_config.model_name = "BAAI/bge-large-en-v1.5"  # Fast and good
+    embedding_config.dimensions =1024
     embedding_config.batch_size = 24
     
     pinecone_config = PineconeConfig(
         api_key=os.getenv("PINECONE_API_KEY"),
-        environment=os.getenv("PINECONE_ENVIRONMENT", "gcp-starter"),
+         region=os.getenv("PINECONE_ENVIRONMENT", "gcp-starter"),
         index_name="hackrx-insurance-docs"
     )
     
@@ -37,13 +37,13 @@ async def process_hackrx_policy_document():
 async def test_hackrx_queries():
     # Configure for insurance documents
     embedding_config = EmbeddingConfig()
-    embedding_config.model_name = "sentence-transformers/all-MiniLM-L6-v2"  # Fast and good
-    embedding_config.dimensions = 384
+    embedding_config.model_name = "BAAI/bge-large-en-v1.5"
+    embedding_config.dimensions = 1024
     embedding_config.batch_size = 24
     
     pinecone_config = PineconeConfig(
         api_key=os.getenv("PINECONE_API_KEY"),
-        environment=os.getenv("PINECONE_ENVIRONMENT", "gcp-starter"),
+        region=os.getenv("PINECONE_ENVIRONMENT", "gcp-starter"),
         index_name="hackrx-insurance-docs"
     )
     
