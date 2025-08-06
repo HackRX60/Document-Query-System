@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# VS Code
+.vscode/
+.history/
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual Environments
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# FAISS or vectorstore files (if any)
+*.faiss
+*.index
+
+# Logs
+*.log
+
+# Misc
+*.bak
+*.tmp
