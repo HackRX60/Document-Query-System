@@ -2,7 +2,8 @@ from fastapi import FastAPI, Depends, HTTPException, status, APIRouter
 from pydantic import BaseModel
 from utils import extract_text_from_pdf, chunk_text, embed_chunks, model
 from vectorstore import build_faiss_index, search_index
-import google.generativeai as genai
+import requests
+import json
 import numpy as np
 import os
 from auth.bearer import verify_bearer_token
@@ -10,46 +11,91 @@ import logging
 from dotenv import load_dotenv
 from sentence_transformers import CrossEncoder
 import time
+import asyncio
+import aiohttp
+import hashlib
+import pickle
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
-# Load environment variables
 load_dotenv()
 
-# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load Gemini API key
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
-    logger.error("GEMINI_API_KEY not found!")
+    logger.error("OPENROUTER_API_KEY not found!")
 else:
-    logger.info(f"GEMINI_API_KEY loaded: {api_key[:10]}...")
+    logger.info(f"OPENROUTER_API_KEY loaded: {api_key[:10]}...")
 
-genai.configure(api_key=api_key)
-
-# FastAPI app and router
-app = FastAPI()
+app = FastAPI(
+    title="Document Query System",
+    description="High-performance document Q&A system",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 router = APIRouter(prefix="/api/v1")
 
-# In-memory cache
-pdf_cache = {}
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
-# Load reranker
+pdf_cache = {}
+cache_lock = threading.Lock()
+
+cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpu-")
+io_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="io-")
+
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# Global session storage
 stored_chunks = []
 stored_embeddings = []
 
-# Request schema
+http_session = None
+
+async def get_http_session():
+    global http_session
+    if http_session is None:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        http_session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(limit=100, limit_per_host=30)
+        )
+    return http_session
+
+def get_cache_key(content: str) -> str:
+    """Generate cache key from content"""
+    return hashlib.md5(content.encode()).hexdigest()
+
+def load_from_persistent_cache(cache_key: str):
+    """Load from persistent cache"""
+    cache_file = CACHE_DIR / f"{cache_key}.pkl"
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}")
+    return None
+
+def save_to_persistent_cache(cache_key: str, data):
+    """Save to persistent cache"""
+    cache_file = CACHE_DIR / f"{cache_key}.pkl"
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(data, f)
+    except Exception as e:
+        logger.warning(f"Failed to save cache: {e}")
+
 class QARequest(BaseModel):
     documents: str
     questions: list[str]
 
-# Answer generator using Gemini
-def generate_answer(question: str, context: str, retries=3) -> str:
-    # Truncate context if too long (Gemini has input limits)
-    max_context_length = 8000  # Conservative limit
+async def generate_answer_async(question: str, context: str, retries=2) -> str:
+    """Async answer generation with connection reuse"""
+    max_context_length = 6000  
     if len(context) > max_context_length:
         context = context[:max_context_length] + "..."
     
@@ -61,151 +107,200 @@ Question: {question}
 
 Answer:"""
 
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "Document Query System"
+    }
+    
+    data = {
+        "model": "deepseek/deepseek-r1-0528:free",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that answers questions based on provided context. Be concise and accurate. Answer in one sentence and normal text only."
+            },
+            {
+                "role": "user", 
+                "content": prompt
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 300, 
+        "top_p": 0.9
+    }
+
+    session = await get_http_session()
+    
     for attempt in range(retries):
         try:
-            # Use generation config for better control
-            generation_config = {
-                "temperature": 0.1,
-                "top_p": 0.8,
-                "top_k": 40,
-                "max_output_tokens": 500,
-            }
-            
-            model = genai.GenerativeModel(
-                "gemini-1.5-flash",
-                generation_config=generation_config
-            )
-            
-            response = model.generate_content(prompt)
-            
-            # Better error handling for the specific error you're seeing
-            if response and response.candidates:
-                candidate = response.candidates[0]
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=data, 
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
                 
-                # Check finish reason
-                if candidate.finish_reason == 1:  # STOP (normal completion)
-                    if candidate.content and candidate.content.parts:
-                        text = candidate.content.parts[0].text
-                        if text and text.strip():
-                            return text.strip()
-                        else:
-                            logger.warning("Response parts exist but text is empty")
-                            return "Unable to generate answer. Please try a different question."
-                    else:
-                        logger.warning("Response has no content parts")
-                        return "Unable to generate answer. Please try a different question."
+                if response.status == 200:
+                    result = await response.json()
+                    
+                    if "choices" in result and len(result["choices"]) > 0:
+                        choice = result["choices"][0]
                         
-                elif candidate.finish_reason == 2:  # MAX_TOKENS
-                    logger.warning("Response was truncated due to max tokens")
-                    return "Answer was too long. Please ask a more specific question."
-                    
-                elif candidate.finish_reason == 3:  # SAFETY
-                    logger.warning("Response blocked by safety filters")
-                    return "Unable to answer due to content policies."
-                    
-                elif candidate.finish_reason == 4:  # RECITATION
-                    logger.warning("Response blocked due to recitation")
-                    return "Unable to answer due to content policies."
-                    
+                        if "message" in choice and "content" in choice["message"]:
+                            answer = choice["message"]["content"].strip()
+                            if answer:
+                                return answer
+                        
+                    return "Unable to generate answer. Please try a different question."
+                        
+                elif response.status == 429: 
+                    if attempt < retries - 1:
+                        await asyncio.sleep(5) 
+                        continue
+                    else:
+                        return "Error: Rate limit exceeded. Please try again later."
+                        
                 else:
-                    logger.warning(f"Unexpected finish reason: {candidate.finish_reason}")
-                    return "Unable to generate answer. Please try again later."
+                    error_text = await response.text()
+                    logger.error(f"HTTP {response.status}: {error_text}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        return f"Error: HTTP {response.status}"
+                        
+        except asyncio.TimeoutError:
+            logger.error(f"Request timeout (attempt {attempt + 1})")
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+                continue
             else:
-                logger.warning("No response candidates received")
-                return "Unable to generate answer. Please try again later."
+                return "Error: Request timeout"
                 
         except Exception as e:
-            logger.error(f"Gemini API error (attempt {attempt + 1}): {e}")
-            
-            # Handle specific API errors
-            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-                if attempt < retries - 1:
-                    sleep_time = 12 * (attempt + 1)
-                    logger.info(f"Rate limit hit, retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                    continue
-                else:
-                    return "Error: Unable to generate answer. Please try again later. (Rate Limit)"
-                    
-            elif "safety" in str(e).lower() or "blocked" in str(e).lower():
-                return "Unable to answer due to content policies."
-                
-            elif "invalid operation" in str(e).lower():
-                return f"Error: Unable to generate answer. Please try again later. (API Error: {str(e)})"
-                
+            logger.error(f"Request error (attempt {attempt + 1}): {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+                continue
             else:
-                if attempt < retries - 1:
-                    time.sleep(2)  # Brief delay before retry
-                    continue
-                else:
-                    return f"Error: Unable to generate answer. Please try again later. (Error: {str(e)})"
+                return f"Error: {str(e)}"
     
     return "Error: Unable to generate answer after multiple attempts."
+
+async def process_document_fast(doc_url: str):
+    """Fast document processing with caching"""
+    cache_key = get_cache_key(doc_url)
+    
+    cached_data = load_from_persistent_cache(cache_key)
+    if cached_data:
+        logger.info("Using persistent cache")
+        return cached_data
+    
+    with cache_lock:
+        if doc_url in pdf_cache:
+            logger.info("Using in-memory cache")
+            return pdf_cache[doc_url]
+    
+    logger.info("Processing document...")
+    loop = asyncio.get_event_loop()
+    
+    text = await loop.run_in_executor(io_executor, extract_text_from_pdf, doc_url)
+    
+    if not text.strip():
+        raise ValueError("No text extracted from PDF.")
+    
+    logger.info(f"Extracted {len(text)} characters.")
+    
+    chunks_task = loop.run_in_executor(cpu_executor, chunk_text, text)
+    chunks = await chunks_task
+    
+    embeddings = await loop.run_in_executor(cpu_executor, embed_chunks, chunks)
+    embeddings_array = np.array(embeddings)
+    
+    await loop.run_in_executor(cpu_executor, build_faiss_index, embeddings_array)
+    
+    result = (chunks, embeddings_array)
+    
+    with cache_lock:
+        pdf_cache[doc_url] = result
+    
+    save_to_persistent_cache(cache_key, result)
+    
+    logger.info("Document processing completed.")
+    return result
+
+async def process_question_fast(question: str, chunks: list, embeddings: np.ndarray):
+    """Fast question processing with parallel execution"""
+    loop = asyncio.get_event_loop()
+    
+    query_embedding = await loop.run_in_executor(
+        cpu_executor, 
+        lambda: model.encode([question])[0]
+    )
+    
+    top_indices = await loop.run_in_executor(
+        cpu_executor,
+        search_index,
+        query_embedding,
+        20,
+        0.3
+    )
+    
+    if not top_indices:
+        return "Not found in document."
+    
+    candidate_chunks = [chunks[idx] for idx in top_indices]
+    
+    pairs = [(question, chunk) for chunk in candidate_chunks]
+    scores = await loop.run_in_executor(
+        cpu_executor,
+        reranker.predict,
+        pairs
+    )
+    
+    reranked = sorted(zip(scores, candidate_chunks), key=lambda x: x[0], reverse=True)
+    
+    top_chunks = "\n".join([chunk for _, chunk in reranked[:3]])
+    
+    answer = await generate_answer_async(question, top_chunks)
+    return answer
 
 @router.post("/hackrx/run")
 async def ask_questions(
     request: QARequest,
     token: str = Depends(verify_bearer_token)
 ):
-    global stored_chunks, stored_embeddings
-
+    """Optimized endpoint with parallel processing"""
+    start_time = time.time()
+    
     logger.info("Received /hackrx/run request")
     logger.info(f"Document: {request.documents}")
-    logger.info(f"Questions: {request.questions}")
+    logger.info(f"Questions: {len(request.questions)} questions")
 
     try:
-        doc_url = request.documents
-
-        if doc_url in pdf_cache:
-            logger.info("Using cached document data.")
-            stored_chunks, stored_embeddings = pdf_cache[doc_url]
-        else:
-            logger.info("Extracting text from PDF URL...")
-            text = extract_text_from_pdf(doc_url)
-
-            if not text.strip():
-                raise ValueError("No text extracted from PDF.")
-
-            logger.info(f"Extracted {len(text)} characters.")
-            chunks = chunk_text(text)
-            embeddings = embed_chunks(chunks)
-
-            stored_chunks = chunks
-            stored_embeddings = np.array(embeddings)
-
-            pdf_cache[doc_url] = (stored_chunks, stored_embeddings)
-            build_faiss_index(stored_embeddings)
-            logger.info("FAISS index built and cached.")
-
-        answers = []
-
-        for i, question in enumerate(request.questions):
-            logger.info(f"Processing Q{i+1}: {question}")
-
-            query_embedding = model.encode([question])[0]
-            top_indices = search_index(query_embedding, top_k=30, threshold=0.3)
-            candidate_chunks = [stored_chunks[idx] for idx in top_indices]
-
-            if not candidate_chunks:
-                answers.append({"question": question, "answer": "Not found in document."})
-                continue
-
-            # Rerank using cross-encoder
-            pairs = [(question, chunk) for chunk in candidate_chunks]
-            scores = reranker.predict(pairs)
-            reranked = sorted(zip(scores, candidate_chunks), key=lambda x: x[0], reverse=True)
-
-            # Log reranked top 5
-            logger.info("Top reranked chunks:")
-            for score, chunk in reranked[:5]:
-                logger.info(f"Score: {score:.2f} | Chunk: {chunk[:100].strip()}")
-
-            top_chunks = "\n".join([chunk for _, chunk in reranked[:5]])
-            answer = generate_answer(question, top_chunks)
-            answers.append({"question": question, "answer": answer})
-            logger.info(f"Answer: {answer}")
-
-        return {"answers": [a["answer"] for a in answers]}
+        chunks, embeddings = await process_document_fast(request.documents)
+        
+        question_tasks = [
+            process_question_fast(question, chunks, embeddings)
+            for question in request.questions
+        ]
+        
+        answers = await asyncio.gather(*question_tasks, return_exceptions=True)
+        
+        final_answers = []
+        for i, answer in enumerate(answers):
+            if isinstance(answer, Exception):
+                logger.error(f"Error processing question {i+1}: {answer}")
+                final_answers.append("Error processing question.")
+            else:
+                final_answers.append(answer)
+        
+        processing_time = time.time() - start_time
+        logger.info(f"Total processing time: {processing_time:.2f} seconds")
+        
+        return {"answers": final_answers}
 
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
@@ -214,5 +309,37 @@ async def ask_questions(
             detail=f"Internal server error: {str(e)}"
         )
 
-# Register router
+@app.on_event("shutdown")
+async def shutdown_event():
+    global http_session
+    if http_session:
+        await http_session.close()
+    
+    cpu_executor.shutdown(wait=True)
+    io_executor.shutdown(wait=True)
+
+@router.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": time.time()}
+
 app.include_router(router)
+
+@app.on_event("startup")
+async def startup_event():
+    
+    logger.info("Starting Document Query System...")
+    logger.info("Warming up models...")
+    
+    try:
+        model.encode(["test query"])
+        logger.info("Embedding model warmed up")
+    except Exception as e:
+        logger.warning(f"Failed to warm up embedding model: {e}")
+    
+    try:
+        reranker.predict([("test question", "test context")])
+        logger.info("Reranker model warmed up")
+    except Exception as e:
+        logger.warning(f"Failed to warm up reranker: {e}")
+    
+    logger.info("System ready!")
