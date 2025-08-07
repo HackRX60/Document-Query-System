@@ -48,35 +48,99 @@ class QARequest(BaseModel):
 
 # Answer generator using Gemini
 def generate_answer(question: str, context: str, retries=3) -> str:
-    prompt = f"""
-You are a helpful assistant. Use ONLY the context below to answer.
+    # Truncate context if too long (Gemini has input limits)
+    max_context_length = 8000  # Conservative limit
+    if len(context) > max_context_length:
+        context = context[:max_context_length] + "..."
+    
+    prompt = f"""Answer the question based on the provided context. If the answer is not in the context, say "Not found in document."
 
-Context:
-{context}
+Context: {context}
 
 Question: {question}
 
-If the answer is not present in the context, reply: "Not found in document."
-
-Answer clearly and briefly in one sentence, based only on the context.
-""".strip()
-
+Answer:"""
 
     for attempt in range(retries):
         try:
-            response = genai.GenerativeModel("gemini-1.5-flash").generate_content(prompt)
-            if response and hasattr(response, 'text') and response.text:
-                return response.text.strip()
+            # Use generation config for better control
+            generation_config = {
+                "temperature": 0.1,
+                "top_p": 0.8,
+                "top_k": 40,
+                "max_output_tokens": 500,
+            }
+            
+            model = genai.GenerativeModel(
+                "gemini-1.5-flash",
+                generation_config=generation_config
+            )
+            
+            response = model.generate_content(prompt)
+            
+            # Better error handling for the specific error you're seeing
+            if response and response.candidates:
+                candidate = response.candidates[0]
+                
+                # Check finish reason
+                if candidate.finish_reason == 1:  # STOP (normal completion)
+                    if candidate.content and candidate.content.parts:
+                        text = candidate.content.parts[0].text
+                        if text and text.strip():
+                            return text.strip()
+                        else:
+                            logger.warning("Response parts exist but text is empty")
+                            return "Unable to generate answer. Please try a different question."
+                    else:
+                        logger.warning("Response has no content parts")
+                        return "Unable to generate answer. Please try a different question."
+                        
+                elif candidate.finish_reason == 2:  # MAX_TOKENS
+                    logger.warning("Response was truncated due to max tokens")
+                    return "Answer was too long. Please ask a more specific question."
+                    
+                elif candidate.finish_reason == 3:  # SAFETY
+                    logger.warning("Response blocked by safety filters")
+                    return "Unable to answer due to content policies."
+                    
+                elif candidate.finish_reason == 4:  # RECITATION
+                    logger.warning("Response blocked due to recitation")
+                    return "Unable to answer due to content policies."
+                    
+                else:
+                    logger.warning(f"Unexpected finish reason: {candidate.finish_reason}")
+                    return "Unable to generate answer. Please try again later."
             else:
-                return "Not found in document."
+                logger.warning("No response candidates received")
+                return "Unable to generate answer. Please try again later."
+                
         except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            if "quota" in str(e).lower() and attempt < retries - 1:
-                sleep_time = 12 * (attempt + 1)
-                logger.info(f"Retrying in {sleep_time} seconds...")
-                time.sleep(sleep_time)
+            logger.error(f"Gemini API error (attempt {attempt + 1}): {e}")
+            
+            # Handle specific API errors
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                if attempt < retries - 1:
+                    sleep_time = 12 * (attempt + 1)
+                    logger.info(f"Rate limit hit, retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                    continue
+                else:
+                    return "Error: Unable to generate answer. Please try again later. (Rate Limit)"
+                    
+            elif "safety" in str(e).lower() or "blocked" in str(e).lower():
+                return "Unable to answer due to content policies."
+                
+            elif "invalid operation" in str(e).lower():
+                return f"Error: Unable to generate answer. Please try again later. (API Error: {str(e)})"
+                
             else:
-                return "Error generating answer."
+                if attempt < retries - 1:
+                    time.sleep(2)  # Brief delay before retry
+                    continue
+                else:
+                    return f"Error: Unable to generate answer. Please try again later. (Error: {str(e)})"
+    
+    return "Error: Unable to generate answer after multiple attempts."
 
 @router.post("/hackrx/run")
 async def ask_questions(
