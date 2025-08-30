@@ -118,8 +118,11 @@ Answer:"""
         "model": "deepseek/deepseek-r1-0528:free",
         "messages": [
             {
-                "role": "system",
-                "content": "You are a helpful assistant that answers questions based on provided context. Be concise and accurate. Answer in one sentence and normal text only."
+               "role": "system",
+                "content": ( "You are a precise assistant. Answer briefly, but include all necessary factual details from the context. If answer is not found, say exactly: Not found in document."
+
+)
+
             },
             {
                 "role": "user", 

@@ -5,7 +5,6 @@ import os
 INDEX_PATH = "faiss_index/index_file"
 
 index = None
-
 def build_faiss_index(embeddings: np.ndarray):
     global index
     dimension = embeddings.shape[1]
